@@ -1,0 +1,43 @@
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Terraform
+*.tfstate
+*.tfstate.*
+.terraform/
+.terraform.lock.hcl
+
+# Secrets
+*.pem
+*.key
+secrets/
+
+# Build artifacts
+dist/
+build/
+
+# Node modules (if applicable)
+node_modules/
+
+# Python (if applicable)
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Kubernetes
+kubeconfig
+*.kubeconfig
+
+# ArgoCD
+argocd-login-token
