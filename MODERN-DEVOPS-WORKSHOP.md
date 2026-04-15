@@ -188,14 +188,50 @@ k8s-mario/
 git clone https://github.com/global-tek/k8s-mario.git
 cd k8s-mario
 
-# Make scripts executable
-chmod +x setup.sh validate.sh
+# Make script executable
+chmod +x script.sh
 
-# Run automated setup
-./setup.sh
+# Execute script
+./script.sh
 
-# Validate installation
-./validate.sh
+# Verify installations
+docker --version
+aws --version
+kubectl version --client
+terraform --version
+```
+
+**Generate a GitHub Personal Access Token** and set your remote:
+
+```bash
+git remote set-url origin https://<USERNAME>:<TOKEN>@github.com/<USERNAME>/k8s-mario.git
+```
+
+**Create a `.gitignore`** to prevent tracking large/binary files:
+
+```
+.terraform*
+*.tfstate
+*.zip
+aws*
+kubectl
+```
+
+# Deploy EKS Cluster with Terraform
+
+```bash
+cd EKS-TF/
+terraform init
+terraform validate
+terraform plan
+terraform apply --auto-approve    # ~10 minutes
+```
+
+After provisioning, update kubeconfig:
+
+```bash
+aws eks update-kubeconfig --name EKS_CLOUD --region <YOUR-REGION>
+```
 
 # Create the new directory structure
 mkdir -p gitops/base
@@ -210,20 +246,30 @@ mkdir -p docs/runbooks
 # Create ECR repository
 aws ecr create-repository \
   --repository-name mario \
-  --region <your-region> \
+  --region <YOUR-REGION> \
   --image-scanning-configuration scanOnPush=true
 
 # Create s3 bucket and make sure to update s3 bucket name in main.tf
 aws s3api create-bucket \
-  --bucket <your-unique-bucket-name> \
-  --region <your-region>
+  --bucket <YOUR-UNIQUE-BUCKET-NAME> \
+  --region <YOUR-REGION>
 
 # Get repository URI
 aws ecr describe-repositories \
   --repository-names mario \
-  --region <your-region> \
+  --region <YOUR-REGION> \
   --query 'repositories[0].repositoryUri' \
   --output text
+
+# Pull, Tag, and Push Mario Docker Image
+
+```bash
+aws ecr get-login-password --region <YOUR-REGION> | docker login --username AWS --password-stdin <ACCOUNT-ID>.dkr.ecr.us-west-2.amazonaws.com
+
+docker pull sevenajay/mario:latest
+docker tag mario:latest <ACCOUNT-ID>.dkr.ecr.us-west-2.amazonaws.com/mario:latest
+docker push <ACCOUNT-ID>.dkr.ecr.us-west-2.amazonaws.com/mario:latest
+```
 
 # Save this URI!
 
@@ -255,7 +301,7 @@ commonLabels:
 
 images:
   - name: mario-game
-    newName: <AWS_ACCOUNT_ID>.dkr.ecr.<your-region>.amazonaws.com/mario
+    newName: <AWS_ACCOUNT_ID>.dkr.ecr.<YOUR-REGION>.amazonaws.com/mario
     newTag: latest  # Will be overridden by environment
 
 configMapGenerator:
