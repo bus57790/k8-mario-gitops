@@ -487,6 +487,12 @@ kubectl port-forward svc/argocd-server -n argocd 8080:443
 # Access at: https://localhost:8080
 # Username: admin
 # Password: (from above command)
+
+# Create a SSL Tunnel if you are unable to connect via your browser on your host
+ssh -i ~/path/to/file.pem \
+  -L 8080:127.0.0.1:8080 \
+  -L 3000:127.0.0.1:3000 \
+  -L 9090:127.0.0.1:9090 ubuntu@44.237.178.59 
 ```
 
 ### Step 2.2: Configure Argo CD CLI (Optional but Recommended)
