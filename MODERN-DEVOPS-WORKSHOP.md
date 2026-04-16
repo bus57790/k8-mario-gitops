@@ -317,6 +317,10 @@ gh auth status
 #### 2. Clone, Rename, and Push to Your Repository
 
 ```bash
+# Set your git identity first — avoids the "configured automatically" warning on every commit
+git config --global user.name "Your Name"
+git config --global user.email "you@example.com"
+
 # Clone the source repo into a new directory named k8s-mario-v2
 git clone https://github.com/Aj7Ay/k8s-mario.git k8s-mario-v2
 cd k8s-mario-v2
@@ -1121,18 +1125,24 @@ kubectl get pods -n istio-system
 
 ### Step 4.2: Install Flagger
 
+> **⚠️ Install Prometheus before Flagger.** Flagger checks connectivity to its metrics server at startup. If Prometheus is not yet running, Flagger logs `Metrics server ... unreachable` and all canaries will stall indefinitely. **Complete Module 5.1 first**, then return here to install Flagger.
+>
 > **⚠️ CRD Ownership Trap:** Do NOT manually `kubectl apply` the CRDs and then pass `--set crd.create=false` to Helm. kubectl-applied CRDs are owned by `kubectl-client-side-apply`, and Helm will refuse to take ownership, printing a conflict error like: `conflict with "kubectl-client-side-apply" using apiextensions.k8s.io/v1`. Instead, let Helm install and own the CRDs by omitting the `--set crd.create=false` flag.
 >
 > **⚠️ Prometheus FQDN:** The Prometheus service lives in the `monitoring` namespace. Short names like `http://prometheus:9090` or `http://prometheus.istio-system:9090` will silently fail — Flagger will log that it can't reach metrics and all canaries will be stuck in `Progressing`. Always use the full cluster-local FQDN.
 
 ```bash
+# Confirm Prometheus is already running before proceeding
+kubectl get pods -n monitoring | grep prometheus-kube-prometheus-prometheus
+# Expected: 2/2 Running
+
 # Add Flagger Helm repository
 helm repo add flagger https://flagger.app
 helm repo update
 
 # Install Flagger — let Helm manage CRDs (do NOT pre-apply CRDs manually)
 # The metricsServer MUST use the full FQDN to reach Prometheus across namespaces.
-# Replace "prometheus-kube-prometheus-prometheus" if your Prometheus service name differs:
+# Verify your Prometheus service name first:
 #   kubectl get svc -n monitoring | grep prometheus
 helm upgrade -i flagger flagger/flagger \
   --namespace=istio-system \
@@ -1142,12 +1152,20 @@ helm upgrade -i flagger flagger/flagger \
 # Verify Flagger is running and can reach Prometheus
 kubectl -n istio-system logs deployment/flagger | grep -i prometheus
 # Expected: no "connection refused" or "no such host" errors
+#
+# If you see "no such host" it means Flagger started before Prometheus was ready.
+# Restart Flagger to re-check:
+#   kubectl rollout restart deployment/flagger -n istio-system
+#   kubectl -n istio-system logs deployment/flagger -f | grep -i prometheus
 
 # Install Flagger load tester (REQUIRED for canary webhooks in Step 4.3)
-kubectl apply -k https://github.com/fluxcd/flagger//kustomize/tester?ref=main -n production
+# The kustomize tester manifest hardcodes namespace "test" — the -n flag is overridden
+# by the manifest itself, so the load tester always lands in the "test" namespace.
+kubectl create namespace test
+kubectl apply -k 'https://github.com/fluxcd/flagger//kustomize/tester?ref=main' -n test
 
 # Verify load tester is up
-kubectl get deploy -n production flagger-loadtester
+kubectl get deploy -n test flagger-loadtester
 ```
 
 ### Step 4.3: Create Canary Resource
@@ -1199,10 +1217,11 @@ spec:
       interval: 1m
     
     # Webhooks — the load tester must already be installed (see Step 4.2).
-    # Use full FQDNs for cross-namespace URLs; short names don't resolve.
+    # The load tester lives in the "test" namespace (kustomize tester hardcodes it).
+    # Use full FQDNs for all cross-namespace URLs; short names don't resolve.
     webhooks:
     - name: load-test
-      url: http://flagger-loadtester.production.svc.cluster.local/
+      url: http://flagger-loadtester.test.svc.cluster.local/
       timeout: 5s
       metadata:
         type: cmd
@@ -1230,16 +1249,24 @@ resources:
 ### Step 4.4: Trigger Canary Deployment
 
 ```bash
-# Update image tag
-# Edit gitops/overlays/production/kustomization.yaml
-# Change newTag to new version
+# Update image tag in the production overlay
+# Edit gitops/overlays/production/kustomization.yaml → change newTag to new version
 
 # Commit and push
-git add gitops/overlays/production/kustomization.yaml
+git add gitops/overlays/production/kustomization.yaml gitops/overlays/production/canary.yaml
 git commit -m "feat: canary deploy v1.2.0"
 git push
 
-# Watch canary progress
+# Argo CD watches the repo but may not have synced the Canary CRD yet
+# (Flagger installs the CRD after Argo CD's last sync cycle).
+# Force a sync before watching:
+argocd app sync mario-production
+argocd app get mario-production   # confirm no errors
+
+# If argocd CLI is not available, use kubectl:
+kubectl get application -n argocd mario-production -o jsonpath='{.status.sync.status}'
+
+# Now watch canary progress
 kubectl -n production get canary mario-canary -w
 
 # Detailed events
@@ -1311,9 +1338,12 @@ To verify Istio is generating metrics for mario:
 # Confirm the sidecar is injected (look for 2/2 READY)
 kubectl get pods -n production
 
-# Query Istio request metrics directly
-kubectl exec -n monitoring -it deployment/prometheus-kube-prometheus-prometheus -- \
-  wget -qO- 'http://localhost:9090/api/v1/query?query=istio_requests_total' | python3 -m json.tool | head -40
+# Query Istio request metrics via port-forward (most reliable)
+# Prometheus runs as a StatefulSet, not a Deployment — use the service instead of exec
+kubectl port-forward -n monitoring svc/prometheus-kube-prometheus-prometheus 9090:9090 &
+sleep 3
+curl -s 'http://localhost:9090/api/v1/query?query=istio_requests_total' \
+  | python3 -m json.tool | head -40
 
 # If the query returns empty, Istio PodMonitors may not be installed — re-run the
 # prometheus-operator.yaml step from Step 5.1.
@@ -1756,6 +1786,45 @@ kubectl delete constraint block-latest-tag
 kubectl apply -f policies/production-constraints.yaml
 ```
 
+### Issue 10: Canary Resource Not Found After Pushing canary.yaml
+
+**Symptom:** `Error from server (NotFound): canaries.flagger.app "mario-canary" not found` even though `canary.yaml` is in the repo.
+
+**Root cause:** Argo CD last synced before Flagger's CRD (`canaries.flagger.app`) was installed. It cached the unknown-CRD error and stopped retrying until the next 3-minute poll.
+
+```bash
+# Force Argo CD to re-evaluate immediately
+argocd app sync mario-production
+
+# Confirm the Canary resource now exists
+kubectl get canary -n production
+
+# If argocd CLI is unavailable, annotate the Application to trigger a sync:
+kubectl annotate application mario-production -n argocd \
+  argocd.argoproj.io/refresh=hard --overwrite
+```
+
+### Issue 11: Flagger Logs "Metrics server unreachable" / "no such host"
+
+**Symptom:** Flagger installed successfully but logs show DNS failures for the Prometheus FQDN.
+
+**Root cause:** Flagger was installed before Prometheus was running. The DNS lookup for `prometheus-kube-prometheus-prometheus.monitoring.svc.cluster.local` fails because the Prometheus pods (and their headless DNS entry) don't exist yet.
+
+```bash
+# Confirm Prometheus is now running
+kubectl get pods -n monitoring | grep prometheus-kube-prometheus-prometheus
+# Expected: 2/2 Running
+
+# Restart Flagger so it re-checks the metrics server
+kubectl rollout restart deployment/flagger -n istio-system
+kubectl rollout status deployment/flagger -n istio-system
+
+# Confirm connectivity — should see no errors after the restart
+kubectl -n istio-system logs deployment/flagger | grep -i prometheus
+```
+
+**Prevention:** Always install Prometheus (Module 5.1) before Flagger (Module 4.2).
+
 ### Issue 3: Canary Stuck in Progressing
 
 The most common causes are: (a) Flagger can't reach Prometheus, (b) no traffic is flowing (no metrics), (c) load tester webhook URL is wrong.
@@ -1769,9 +1838,9 @@ kubectl logs -n istio-system deployment/flagger -f | grep -iE "error|warn|promet
 kubectl -n istio-system exec -it deployment/flagger -- \
   wget -qO- 'http://prometheus-kube-prometheus-prometheus.monitoring.svc.cluster.local:9090/api/v1/query?query=up' | head -c 200
 
-# Step 3: Check load tester is running (needed to generate traffic for metrics)
-kubectl get deploy -n production flagger-loadtester
-kubectl logs -n production deployment/flagger-loadtester | tail -20
+# Step 3: Check load tester is running (it lives in the "test" namespace)
+kubectl get deploy -n test flagger-loadtester
+kubectl logs -n test deployment/flagger-loadtester | tail -20
 
 # Step 4: Verify Istio metrics exist for mario
 kubectl port-forward -n monitoring svc/prometheus-kube-prometheus-prometheus 9090:9090 &
