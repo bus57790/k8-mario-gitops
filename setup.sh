@@ -307,8 +307,8 @@ main() {
             install_argocd
             install_gatekeeper
             install_istio
+            install_monitoring   # Prometheus must be running before Flagger starts
             install_flagger
-            install_monitoring
             create_ecr
             deploy_app
             show_summary

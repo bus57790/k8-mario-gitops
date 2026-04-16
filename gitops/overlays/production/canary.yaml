@@ -33,8 +33,9 @@ spec:
     
     webhooks:
     - name: load-test
-      # Use full FQDN — short names don't resolve across namespaces
-      url: http://flagger-loadtester.production.svc.cluster.local/
+      # Load tester lives in "test" namespace — kustomize tester hardcodes it.
+      # Use full FQDNs for all cross-namespace URLs; short names don't resolve.
+      url: http://flagger-loadtester.test.svc.cluster.local/
       timeout: 5s
       metadata:
         type: cmd
