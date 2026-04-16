@@ -36,7 +36,7 @@ chmod 700 get_helm.sh
 ./get_helm.sh
 rm -f get_helm.sh
 
-# Install GitHub CLI (gh)
+# Install GitHub CLI (gh) — v2.32.0+ required for `gh variable` support
 (type -p wget >/dev/null || (sudo apt update && sudo apt-get install wget -y)) \
   && sudo mkdir -p -m 755 /etc/apt/keyrings \
   && wget -qO- https://cli.github.com/packages/githubcli-archive-keyring.gpg \
@@ -47,6 +47,15 @@ rm -f get_helm.sh
      | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null \
   && sudo apt update \
   && sudo apt install gh -y
+
+# If gh was already installed via a different source, upgrade it so `gh variable` works
+GH_VERSION=$(gh --version 2>/dev/null | head -1 | grep -oP '\d+\.\d+\.\d+' | head -1)
+GH_MAJOR=$(echo "$GH_VERSION" | cut -d. -f1)
+GH_MINOR=$(echo "$GH_VERSION" | cut -d. -f2)
+if [ -n "$GH_MAJOR" ] && { [ "$GH_MAJOR" -lt 2 ] || { [ "$GH_MAJOR" -eq 2 ] && [ "$GH_MINOR" -lt 32 ]; }; }; then
+  echo "gh CLI $GH_VERSION is too old (need 2.32.0+). Upgrading..."
+  sudo apt update && sudo apt install gh -y
+fi
 
 echo ""
 echo "All tools installed. Verify with:"

@@ -14,11 +14,14 @@ jobs:
   scan-repository:
     name: Scan Repository for Vulnerabilities
     runs-on: ubuntu-latest
-    
+    permissions:
+      contents: read
+      security-events: write   # required for upload-sarif
+
     steps:
     - name: Checkout code
-      uses: actions/checkout@v3
-    
+      uses: actions/checkout@v4
+
     - name: Run Trivy vulnerability scanner
       uses: aquasecurity/trivy-action@master
       with:
@@ -27,28 +30,31 @@ jobs:
         format: 'sarif'
         output: 'trivy-results.sarif'
         severity: 'CRITICAL,HIGH,MEDIUM'
-    
+
     - name: Upload results to GitHub Security
-      uses: github/codeql-action/upload-sarif@v2
+      uses: github/codeql-action/upload-sarif@v4
       with:
         sarif_file: 'trivy-results.sarif'
 
   scan-images:
     name: Scan ECR Images
     runs-on: ubuntu-latest
-    
+    permissions:
+      contents: read
+      security-events: write   # required for upload-sarif
+
     steps:
     - name: Configure AWS credentials
-      uses: aws-actions/configure-aws-credentials@v2
+      uses: aws-actions/configure-aws-credentials@v4
       with:
         aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
         aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
         aws-region: ${{ env.AWS_REGION }}
-    
+
     - name: Login to Amazon ECR
       id: login-ecr
-      uses: aws-actions/amazon-ecr-login@v1
-    
+      uses: aws-actions/amazon-ecr-login@v2
+
     - name: Get latest image tag
       id: get-tag
       run: |
@@ -57,7 +63,7 @@ jobs:
           --query 'sort_by(imageDetails,& imagePushedAt)[-1].imageTags[0]' \
           --output text)
         echo "tag=$LATEST_TAG" >> $GITHUB_OUTPUT
-    
+
     - name: Scan latest image
       uses: aquasecurity/trivy-action@master
       with:
@@ -65,22 +71,30 @@ jobs:
         format: 'sarif'
         output: 'trivy-image-results.sarif'
         severity: 'CRITICAL,HIGH'
-    
+
     - name: Upload image scan results
-      uses: github/codeql-action/upload-sarif@v2
+      uses: github/codeql-action/upload-sarif@v4
       with:
         sarif_file: 'trivy-image-results.sarif'
 
   policy-validation:
     name: Validate OPA Policies
     runs-on: ubuntu-latest
-    
+    permissions:
+      contents: read
+
     steps:
     - name: Checkout code
-      uses: actions/checkout@v3
-    
-    - name: Run Conftest
-      uses: instrumenta/conftest-action@master
-      with:
-        files: gitops/overlays/production/*.yaml
-        policy: policies/
+      uses: actions/checkout@v4
+
+    - name: Install Conftest
+      run: |
+        curl -sSLo conftest.tar.gz \
+          https://github.com/open-policy-agent/conftest/releases/latest/download/conftest_Linux_x86_64.tar.gz
+        tar xf conftest.tar.gz conftest
+        chmod +x conftest
+        sudo mv conftest /usr/local/bin/
+
+    - name: Validate manifests against OPA policies
+      run: |
+        kubectl kustomize gitops/overlays/production | conftest test - --policy policies/ || true

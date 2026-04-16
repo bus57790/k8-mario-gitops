@@ -1531,9 +1531,32 @@ gh variable list
 
 > **Secrets vs. Variables:** Secrets are for credentials — they are masked in all logs and can never be read back after being set. Variables are for non-sensitive config (region, repo name) — they appear in workflow logs and are easy to update.
 
-### Step 6.2: GitHub Actions CI Pipeline
+### Step 6.2: Commit and Push the Workflow Files
 
-The pipeline is already in `.github/workflows/ci-pipeline.yaml`. It uses `vars.*` for configuration so there are no hard-coded values to change per student.
+The workflow files live in `.github/workflows/` but **must be committed to git** before GitHub Actions will run them. If you haven't done this yet:
+
+```bash
+# Verify the files exist
+ls .github/workflows/
+# Expected: ci-pipeline.yaml  security-scan.yaml
+
+# Add istio download directory to .gitignore (don't commit binaries)
+grep -q "istio-\*/" .gitignore || echo "istio-*/" >> .gitignore
+
+# Commit workflows, policies, and updated .gitignore
+git add .github/ policies/ .gitignore
+git commit -m "ci: add GitHub Actions workflows and OPA Gatekeeper policies"
+git push
+
+# Confirm Actions are now queued
+gh run list --limit 3
+```
+
+> **Why this step is easy to miss:** The workshop repo already has these files in the reference copy, but after you cloned the bare upstream and pushed to your own repo in Step 1.1, these files had not yet been committed. `gh pr create` will warn "N uncommitted changes" if you forget — that warning means your workflows aren't in the repo yet.
+
+### Step 6.3: GitHub Actions CI Pipeline
+
+The pipeline in `.github/workflows/ci-pipeline.yaml` uses `vars.*` for configuration so there are no hard-coded values to change per student.
 
 **What the pipeline does:**
 
@@ -1735,25 +1758,66 @@ jobs:
 
 ### Step 7.1: End-to-End Test Workflow
 
+This test drives the **full delivery chain**: Git commit → GitHub Actions CI → ECR push → GitOps manifest update → Argo CD sync → Flagger canary analysis.
+
+> **What triggers the pipeline?**  
+> The CI pipeline retagges `sevenajay/mario:latest` with an immutable `main-<sha7>` tag and pushes it to ECR, then the `update-gitops` job commits the new tag into `gitops/overlays/production/kustomization.yaml`. Any push to `main` triggers this — we use a real manifest change so the commit is meaningful.
+
 ```bash
-# 1. Make a change
-echo "<!-- New feature -->" >> index.html
-git add index.html
-git commit -m "feat: add new feature"
-git push
+# ── Stage 1: Create a feature branch and make a real change ──────────────────
+git checkout -b deploy/e2e-test
 
-# 2. Watch GitHub Actions
-# Go to: https://github.com/<your-repo>/actions
+# Bump the deployment version annotation (a real GitOps-style change)
+DATESTAMP=$(date +%Y%m%d-%H%M)
+sed -i "s|app.kubernetes.io/version:.*|app.kubernetes.io/version: \"e2e-$DATESTAMP\"|" \
+  gitops/base/deployment.yaml
 
-# 3. Monitor Argo CD sync
-argocd app get mario-production --refresh
+git add gitops/base/deployment.yaml
+git commit -m "chore: e2e pipeline test $DATESTAMP"
+git push -u origin deploy/e2e-test
 
-# 4. Watch Canary rollout
-kubectl -n production get canary mario-canary -w
+# ── Stage 2: Open and merge a PR (same pattern as Module 2.5) ─────────────────
+gh pr create \
+  --base main \
+  --title "chore: e2e pipeline test $DATESTAMP" \
+  --body "End-to-end validation: CI → ECR retag → GitOps update → Argo CD → Flagger canary"
 
-# 5. Verify application
-kubectl get svc -n production
-# Access LoadBalancer URL
+gh pr merge --merge --delete-branch
+git checkout main && git pull
+
+# ── Stage 3: Watch the GitHub Actions pipeline ────────────────────────────────
+# Shows current runs — the merged PR push should appear at the top
+gh run list --limit 3
+
+# Stream live logs until the workflow completes (Ctrl+C to exit after it finishes)
+gh run watch
+
+# ── Stage 4: Confirm the pipeline updated kustomization.yaml ─────────────────
+# The update-gitops job commits a new newTag (e.g. main-a1b2c3d) back to main
+git pull
+grep newTag gitops/overlays/production/kustomization.yaml
+# Expected: newTag: main-<short-sha>
+
+# ── Stage 5: Trigger / watch Argo CD sync ────────────────────────────────────
+# Argo CD polls every 3 minutes; force it now:
+argocd app sync mario-production
+
+kubectl get application -n argocd mario-production -w
+# Wait for STATUS: Synced  HEALTH: Healthy
+
+# ── Stage 6: Watch Flagger canary analysis ────────────────────────────────────
+kubectl get canary -n production mario-canary -w
+# Expected progression:
+#   mario-canary   Initialized   False
+#   mario-canary   Progressing   False   10    (10% traffic to canary)
+#   mario-canary   Progressing   False   20    ...
+#   mario-canary   Progressing   False   50
+#   mario-canary   Succeeded     False
+
+# ── Stage 7: Verify the live image ───────────────────────────────────────────
+kubectl get deployment -n production mario-deployment \
+  -o jsonpath='{.spec.template.spec.containers[0].image}{"\n"}'
+# Expected: <ecr-registry>/mario:main-<sha7>
 ```
 
 ### Step 7.2: Test Policy Enforcement
