@@ -1346,18 +1346,49 @@ curl -s 'http://localhost:9090/api/v1/query?query=istio_requests_total' \
   | python3 -m json.tool | head -40
 
 # If the query returns empty, Istio PodMonitors may not be installed — re-run the
-# prometheus-operator.yaml step from Step 5.1.
+# prometheus-operator.yaml step from Step 5.1, then re-run the traffic generator in Step 5.3.
 ```
 
 If you want **custom application-level metrics** in the future, add a Prometheus exporter sidecar or use an app framework that exposes `/metrics`. For this workshop, Istio sidecar metrics are sufficient for Flagger's canary analysis.
 
-### Step 5.3: Access Grafana
+### Step 5.3: Seed Istio Metrics with Test Traffic
+
+> **Grafana will show "No data" until real HTTP traffic hits the mario service.** Istio only generates `istio_requests_total` and related metrics when requests flow through its sidecar. The Flagger load tester only runs during an active canary analysis — during `Initialized` the service is completely idle. Run this before opening Grafana.
+
+```bash
+# Generate 50 requests (one per second) from inside the cluster
+kubectl run -it --rm traffic-gen \
+  --image=curlimages/curl \
+  --restart=Never \
+  -n production -- \
+  sh -c 'for i in $(seq 1 50); do
+    curl -s http://mario-service.production.svc.cluster.local/ > /dev/null
+    echo "Request $i"
+    sleep 1
+  done'
+
+# Verify Prometheus received the metrics (wait ~30s after traffic finishes)
+kubectl port-forward -n monitoring svc/prometheus-kube-prometheus-prometheus 9090:9090 &
+sleep 5
+
+# Should return a non-zero count
+curl -s 'http://localhost:9090/api/v1/query?query=count(istio_requests_total)' \
+  | python3 -m json.tool | grep value
+
+# See what service names Istio reported (verify the regex in the dashboard will match)
+curl -s 'http://localhost:9090/api/v1/label/destination_service_name/values' \
+  | python3 -m json.tool
+# Expected to include: "mario-service", "mario-service-primary", or similar
+```
+
+### Step 5.4: Access Grafana
 
 ```bash
 # Get Grafana password
-kubectl get secret -n monitoring prometheus-grafana -o jsonpath="{.data.admin-password}" | base64 -d
+kubectl get secret -n monitoring prometheus-grafana \
+  -o jsonpath="{.data.admin-password}" | base64 -d
 
-# Port-forward
+# Port-forward (keep the Prometheus port-forward from above running too)
 kubectl port-forward -n monitoring svc/prometheus-grafana 3000:80
 
 # Access: http://localhost:3000
@@ -1365,7 +1396,7 @@ kubectl port-forward -n monitoring svc/prometheus-grafana 3000:80
 # Password: (from above)
 ```
 
-### Step 5.4: Import Grafana Dashboards
+### Step 5.5: Import Grafana Dashboards
 
 > **⚠️ Grafana.com dashboard IDs may not resolve** (shows "Dashboard not found" or times out). Use the JSON download approach instead.
 >
@@ -1436,7 +1467,20 @@ histogram_quantile(0.99, sum(irate(istio_request_duration_milliseconds_bucket{de
 
 > **Do this before pushing the pipeline** — the workflow reads `secrets.*` and `vars.*` at runtime, so they must exist before the first run.
 
-The ECR repository was already created in Step 1.1. Retrieve your ECR registry URI and set everything via gh CLI:
+The ECR repository was already created in Step 1.1. Retrieve your ECR registry URI and set everything via gh CLI.
+
+> **`gh variable` requires gh CLI v2.32.0 or later.** Check your version and upgrade if needed before running the commands below:
+> ```bash
+> gh --version
+> # If below 2.32.0, upgrade:
+> (type -p wget >/dev/null || (sudo apt update && sudo apt-get install wget -y)) \
+> && sudo mkdir -p -m 755 /etc/apt/keyrings \
+> && wget -qO- https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo tee /etc/apt/keyrings/githubcli-archive-keyring.gpg > /dev/null \
+> && sudo chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+> && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null \
+> && sudo apt update \
+> && sudo apt install gh -y
+> ```
 
 ```bash
 # Get your ECR registry URI (set AWS_REGION if not already exported)
@@ -1452,6 +1496,7 @@ gh secret set AWS_ACCESS_KEY_ID     --body "<your-access-key-id>"
 gh secret set AWS_SECRET_ACCESS_KEY --body "<your-secret-access-key>"
 
 # ── Variables (plaintext config referenced by the pipeline) ──────────────────
+# Requires gh CLI v2.32.0+
 gh variable set AWS_REGION      --body "$AWS_REGION"
 gh variable set ECR_REPOSITORY  --body "mario"
 gh variable set ECR_REGISTRY    --body "$ECR_REGISTRY"
@@ -1460,6 +1505,29 @@ gh variable set ECR_REGISTRY    --body "$ECR_REGISTRY"
 gh secret list
 gh variable list
 ```
+
+> **If `gh variable` shows "unknown command"**, use the `gh api` fallback — this works on any version:
+> ```bash
+> REPO=$(gh repo view --json nameWithOwner -q .nameWithOwner)
+>
+> # Create each variable via the GitHub Actions Variables API
+> for VAR_NAME in AWS_REGION ECR_REPOSITORY ECR_REGISTRY; do
+>   case $VAR_NAME in
+>     AWS_REGION)     VAL="$AWS_REGION" ;;
+>     ECR_REPOSITORY) VAL="mario" ;;
+>     ECR_REGISTRY)   VAL="$ECR_REGISTRY" ;;
+>   esac
+>   gh api --method POST \
+>     -H "Accept: application/vnd.github+json" \
+>     "/repos/$REPO/actions/variables" \
+>     -f name="$VAR_NAME" \
+>     -f value="$VAL" \
+>     && echo "Set $VAR_NAME"
+> done
+>
+> # List variables to verify
+> gh api /repos/$REPO/actions/variables | python3 -m json.tool
+> ```
 
 > **Secrets vs. Variables:** Secrets are for credentials — they are masked in all logs and can never be read back after being set. Variables are for non-sensitive config (region, repo name) — they appear in workflow logs and are easy to update.
 
