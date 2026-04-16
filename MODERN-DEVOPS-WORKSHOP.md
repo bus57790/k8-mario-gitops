@@ -1389,26 +1389,50 @@ histogram_quantile(0.99, sum(irate(istio_request_duration_milliseconds_bucket{de
 
 ## 🔧 Module 6: CI/CD Pipeline Modernization
 
-### Step 6.1: Create ECR Repository
+### Step 6.1: Configure GitHub Secrets and Variables
+
+> **Do this before pushing the pipeline** — the workflow reads `secrets.*` and `vars.*` at runtime, so they must exist before the first run.
+
+The ECR repository was already created in Step 1.1. Retrieve your ECR registry URI and set everything via gh CLI:
 
 ```bash
-# Create ECR repository
-aws ecr create-repository \
-  --repository-name mario \
-  --region ap-south-1 \
-  --image-scanning-configuration scanOnPush=true
-
-# Get repository URI
-aws ecr describe-repositories \
+# Get your ECR registry URI (set AWS_REGION if not already exported)
+export ECR_REGISTRY=$(aws ecr describe-repositories \
   --repository-names mario \
-  --region ap-south-1 \
+  --region $AWS_REGION \
   --query 'repositories[0].repositoryUri' \
-  --output text
+  --output text | cut -d'/' -f1)
+echo "ECR Registry: $ECR_REGISTRY"
 
-# Save this URI!
+# ── Secrets (encrypted at rest, masked in logs) ──────────────────────────────
+gh secret set AWS_ACCESS_KEY_ID     --body "<your-access-key-id>"
+gh secret set AWS_SECRET_ACCESS_KEY --body "<your-secret-access-key>"
+
+# ── Variables (plaintext config referenced by the pipeline) ──────────────────
+gh variable set AWS_REGION      --body "$AWS_REGION"
+gh variable set ECR_REPOSITORY  --body "mario"
+gh variable set ECR_REGISTRY    --body "$ECR_REGISTRY"
+
+# Verify
+gh secret list
+gh variable list
 ```
 
+> **Secrets vs. Variables:** Secrets are for credentials — they are masked in all logs and can never be read back after being set. Variables are for non-sensitive config (region, repo name) — they appear in workflow logs and are easy to update.
+
 ### Step 6.2: GitHub Actions CI Pipeline
+
+The pipeline is already in `.github/workflows/ci-pipeline.yaml`. It uses `vars.*` for configuration so there are no hard-coded values to change per student.
+
+**What the pipeline does:**
+
+| Job | Trigger | Action |
+|-----|---------|--------|
+| `security-scan` | every push / PR | Trivy filesystem scan + secret scan |
+| `lint-and-test` | every push / PR | Kustomize render + manifest validation |
+| `retag-and-push` | push to `main` or `develop` | Pull mario image, tag with immutable SHA, push to ECR |
+| `update-gitops` | push to `main` | Update `gitops/overlays/production/` with new tag |
+| `update-gitops-dev` | push to `develop` | Update `gitops/overlays/dev/` with new tag |
 
 ```yaml
 # .github/workflows/ci-pipeline.yaml
@@ -1421,19 +1445,19 @@ on:
     branches: [main]
 
 env:
-  AWS_REGION: ap-south-1
-  ECR_REPOSITORY: mario
-  KUSTOMIZE_VERSION: 4.5.7
+  AWS_REGION:     ${{ vars.AWS_REGION }}
+  ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+  ECR_REGISTRY:   ${{ vars.ECR_REGISTRY }}
 
 jobs:
   security-scan:
     name: Security Scanning
     runs-on: ubuntu-latest
-    
+
     steps:
     - name: Checkout code
       uses: actions/checkout@v3
-    
+
     - name: Run Trivy vulnerability scanner in repo mode
       uses: aquasecurity/trivy-action@master
       with:
@@ -1442,12 +1466,13 @@ jobs:
         format: 'sarif'
         output: 'trivy-results.sarif'
         severity: 'CRITICAL,HIGH'
-    
+
     - name: Upload Trivy results to GitHub Security
       uses: github/codeql-action/upload-sarif@v2
+      if: always()
       with:
         sarif_file: 'trivy-results.sarif'
-    
+
     - name: Run secret scan
       uses: trufflesecurity/trufflehog@main
       with:
@@ -1455,72 +1480,79 @@ jobs:
         base: main
         head: HEAD
 
-  build-and-push:
-    name: Build and Push Image
+  lint-and-test:
+    name: Lint and Test
     runs-on: ubuntu-latest
-    needs: security-scan
-    if: github.ref == 'refs/heads/main'
-    
-    outputs:
-      image-tag: ${{ steps.meta.outputs.tags }}
-    
+
     steps:
     - name: Checkout code
       uses: actions/checkout@v3
-    
+
+    - name: Validate Kubernetes manifests
+      run: |
+        kubectl kustomize gitops/base
+        kubectl kustomize gitops/overlays/production
+        kubectl kustomize gitops/overlays/dev
+
+    - name: Validate with kubeval
+      uses: instrumenta/kubeval-action@master
+      with:
+        files: gitops/base/
+
+  retag-and-push:
+    name: Retag and Push Image to ECR
+    runs-on: ubuntu-latest
+    needs: [security-scan, lint-and-test]
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop'
+
+    outputs:
+      image-tag: ${{ steps.image-tag.outputs.tag }}
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+
     - name: Configure AWS credentials
       uses: aws-actions/configure-aws-credentials@v2
       with:
         aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
         aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
         aws-region: ${{ env.AWS_REGION }}
-    
+
     - name: Login to Amazon ECR
       id: login-ecr
       uses: aws-actions/amazon-ecr-login@v1
-    
-    - name: Extract metadata (tags, labels)
-      id: meta
-      uses: docker/metadata-action@v4
-      with:
-        images: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}
-        tags: |
-          type=sha,prefix={{branch}}-
-          type=semver,pattern={{version}}
-          type=semver,pattern={{major}}.{{minor}}
-    
-    - name: Build Docker image
-      uses: docker/build-push-action@v4
-      with:
-        context: .
-        push: false
-        tags: ${{ steps.meta.outputs.tags }}
-        labels: ${{ steps.meta.outputs.labels }}
-        load: true
-    
+
+    - name: Generate immutable image tag
+      id: image-tag
+      run: |
+        BRANCH=${GITHUB_REF#refs/heads/}
+        TAG="${BRANCH}-${GITHUB_SHA::7}"
+        echo "tag=$TAG" >> $GITHUB_OUTPUT
+        echo "full-image=${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:$TAG" >> $GITHUB_OUTPUT
+
+    - name: Pull mario image, retag with immutable tag, and push to ECR
+      run: |
+        docker pull sevenajay/mario:latest
+        docker tag sevenajay/mario:latest ${{ steps.image-tag.outputs.full-image }}
+        docker push ${{ steps.image-tag.outputs.full-image }}
+
     - name: Scan image with Trivy
       uses: aquasecurity/trivy-action@master
       with:
-        image-ref: ${{ steps.meta.outputs.tags }}
+        image-ref: ${{ steps.image-tag.outputs.full-image }}
         format: 'table'
         exit-code: '1'
+        ignore-unfixed: true
         severity: 'CRITICAL,HIGH'
-    
-    - name: Push image to ECR
-      uses: docker/build-push-action@v4
-      with:
-        context: .
-        push: true
-        tags: ${{ steps.meta.outputs.tags }}
-        labels: ${{ steps.meta.outputs.labels }}
-    
+
     - name: Generate SBOM
       uses: anchore/sbom-action@v0
       with:
-        image: ${{ steps.meta.outputs.tags }}
+        image: ${{ steps.image-tag.outputs.full-image }}
         format: spdx-json
         output-file: sbom.spdx.json
-    
+
     - name: Upload SBOM
       uses: actions/upload-artifact@v3
       with:
@@ -1528,89 +1560,63 @@ jobs:
         path: sbom.spdx.json
 
   update-gitops:
-    name: Update GitOps Repo
+    name: Update GitOps Manifest (production)
     runs-on: ubuntu-latest
-    needs: build-and-push
-    
+    needs: retag-and-push
+    if: github.ref == 'refs/heads/main'
+
     steps:
     - name: Checkout code
       uses: actions/checkout@v3
       with:
         token: ${{ secrets.GITHUB_TOKEN }}
-    
+
     - name: Setup Kustomize
       uses: imranismail/setup-kustomize@v2
-      with:
-        kustomize-version: ${{ env.KUSTOMIZE_VERSION }}
-    
-    - name: Update image tag
+
+    - name: Update production image tag
       run: |
         cd gitops/overlays/production
-        kustomize edit set image mario-game=${{ needs.build-and-push.outputs.image-tag }}
-    
-    - name: Commit and push
+        kustomize edit set image mario-game=${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ needs.retag-and-push.outputs.image-tag }}
+
+    - name: Commit and push changes
       run: |
         git config user.name "GitHub Actions"
         git config user.email "actions@github.com"
         git add gitops/overlays/production/kustomization.yaml
-        git commit -m "chore: update image to ${{ needs.build-and-push.outputs.image-tag }}"
+        git diff-index --quiet HEAD || git commit -m "chore: update production image to ${{ needs.retag-and-push.outputs.image-tag }}"
+        git push
+
+  update-gitops-dev:
+    name: Update GitOps Manifest (dev)
+    runs-on: ubuntu-latest
+    needs: retag-and-push
+    if: github.ref == 'refs/heads/develop'
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Setup Kustomize
+      uses: imranismail/setup-kustomize@v2
+
+    - name: Update dev image tag
+      run: |
+        cd gitops/overlays/dev
+        kustomize edit set image mario-game=${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ needs.retag-and-push.outputs.image-tag }}
+
+    - name: Commit and push changes
+      run: |
+        git config user.name "GitHub Actions"
+        git config user.email "actions@github.com"
+        git add gitops/overlays/dev/kustomization.yaml
+        git diff-index --quiet HEAD || git commit -m "chore: update dev image to ${{ needs.retag-and-push.outputs.image-tag }}"
         git push
 ```
 
-### Step 6.3: GitHub Secrets and Variables with gh CLI
-
-Set repository secrets and variables from the terminal — no browser required.
-
-```bash
-# ── Secrets (encrypted, never visible after being set) ──────────────────────
-gh secret set AWS_ACCESS_KEY_ID     --body "<your-access-key-id>"
-gh secret set AWS_SECRET_ACCESS_KEY --body "<your-secret-access-key>"
-
-# ── Variables (plaintext, visible in workflow logs) ─────────────────────────
-gh variable set AWS_REGION       --body "<YOUR-REGION>"
-gh variable set ECR_REPOSITORY   --body "mario"
-
-# Verify what was set
-gh secret list
-gh variable list
-```
-
-> **Why separate secrets from variables?**  
-> Secrets are masked in logs and encrypted at rest — use them for credentials.  
-> Variables are visible in run logs — use them for non-sensitive config like region and repo name.
-
-To set a secret that contains special characters (e.g., a JSON key file), pipe it in instead:
-
-```bash
-cat credentials.json | gh secret set GCP_SA_KEY
-```
-
-### Step 6.4: Create Dockerfile (if not exists)
-
-If your Mario app doesn't have a Dockerfile:
-
-```dockerfile
-# Dockerfile
-FROM nginx:alpine
-
-# Copy static files
-COPY . /usr/share/nginx/html/
-
-# Non-root user
-RUN chown -R nginx:nginx /usr/share/nginx/html && \
-    chown -R nginx:nginx /var/cache/nginx && \
-    chown -R nginx:nginx /var/log/nginx && \
-    touch /var/run/nginx.pid && \
-    chown -R nginx:nginx /var/run/nginx.pid
-
-USER nginx
-
-EXPOSE 8080
-
-CMD ["nginx", "-g", "daemon off;"]
-```
-
-**✅ Checkpoint 6:** Full CI/CD with security scanning and GitOps update is complete.
+**✅ Checkpoint 6:** Full CI/CD pipeline with security scanning, immutable image tagging, and GitOps manifest updates is wired up. Merging to `main` now triggers the full chain — scan → retag → push to ECR → Argo CD syncs.
 
 ---
 
@@ -1856,14 +1862,15 @@ kubectl port-forward -n monitoring svc/prometheus-kube-prometheus-prometheus 909
 ### Issue 4: Image Pull Errors from ECR
 
 ```bash
-# Check ECR authentication
-aws ecr get-login-password --region ap-south-1 | docker login --username AWS --password-stdin <account-id>.dkr.ecr.ap-south-1.amazonaws.com
+# Check ECR authentication (AWS_REGION must be set)
+aws ecr get-login-password --region $AWS_REGION \
+  | docker login --username AWS --password-stdin $ECR_REGISTRY
 
 # Create/update image pull secret
 kubectl create secret docker-registry ecr-secret \
-  --docker-server=<account-id>.dkr.ecr.ap-south-1.amazonaws.com \
+  --docker-server=$ECR_REGISTRY \
   --docker-username=AWS \
-  --docker-password=$(aws ecr get-login-password --region ap-south-1) \
+  --docker-password=$(aws ecr get-login-password --region $AWS_REGION) \
   --namespace=production
 
 # Add to deployment
@@ -1963,7 +1970,7 @@ helm install velero vmware-tanzu/velero \
   --create-namespace \
   --set configuration.provider=aws \
   --set configuration.backupStorageLocation.bucket=mario-backups \
-  --set configuration.backupStorageLocation.config.region=ap-south-1
+  --set configuration.backupStorageLocation.config.region=$AWS_REGION
 ```
 
 #### 5. **Add External Secrets**

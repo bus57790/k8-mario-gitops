@@ -177,14 +177,14 @@ kubectl exec -n monitoring prometheus-kube-prometheus-prometheus-0 -- \
 ### ECR Operations
 ```bash
 # Login to ECR
-aws ecr get-login-password --region ap-south-1 | \
+aws ecr get-login-password --region $AWS_REGION | \
   docker login --username AWS --password-stdin \
-  <account-id>.dkr.ecr.ap-south-1.amazonaws.com
+  $ECR_REGISTRY
 
 # List images
 aws ecr describe-images \
   --repository-name mario \
-  --region ap-south-1
+  --region $AWS_REGION
 
 # Build and push image
 docker build -t mario:v1.0.0 .
@@ -195,13 +195,13 @@ docker push <ecr-uri>:v1.0.0
 aws ecr start-image-scan \
   --repository-name mario \
   --image-id imageTag=v1.0.0 \
-  --region ap-south-1
+  --region $AWS_REGION
 
 # Get scan results
 aws ecr describe-image-scan-findings \
   --repository-name mario \
   --image-id imageTag=v1.0.0 \
-  --region ap-south-1
+  --region $AWS_REGION
 ```
 
 ### Istio
@@ -264,9 +264,9 @@ kubectl get events -n production --sort-by='.lastTimestamp'
 ```bash
 # Create ECR secret
 kubectl create secret docker-registry ecr-secret \
-  --docker-server=<account-id>.dkr.ecr.ap-south-1.amazonaws.com \
+  --docker-server=$ECR_REGISTRY \
   --docker-username=AWS \
-  --docker-password=$(aws ecr get-login-password --region ap-south-1) \
+  --docker-password=$(aws ecr get-login-password --region $AWS_REGION) \
   --namespace=production
 
 # Verify secret
